@@ -145,11 +145,15 @@ def lstm_train(use_saved = False):
 def ppo_train():
     C1 = -1
     C2 = -2
-    rewards = []
+    gamma = 0.9
+    epsilon = 0.2
+    lr = 0.0001
 
     lstm = lstm_train(True)
-    actor_model = mlp_train(True)
-    critic_model = MLP(input_dim, hidden_dim, 1)
+    actor = mlp_train(True)
+    critic = MLP(input_dim, hidden_dim, 1)
+    actor_optim = optim.Adam(actor.parameters(), lr=lr)
+    critic_optim = optim.Adam(critic.parameters(), lr=lr)
 
     lstm.eval()
     #actor_model.eval()
@@ -159,33 +163,102 @@ def ppo_train():
     sofa_index = observation_cols.index('o:SOFA')
     lactate_index = observation_cols.index('o:Arterial_lactate')
 
-    epochs = 10
+    epochs = 100
+    trajs_per_epoch = 500
     timesteps = 10
+    num_iters = 5
     for epoch in range(epochs):
-        indices = torch.randperm(x.size(0))[:100]
+
+        print(f"\nEpoch {epoch+1} out of {epochs}")
+
+        batch_rewards = []
+        batch_action_probs = []
+
+        # starting state of rollout
+        indices = torch.randperm(x.size(0))[:trajs_per_epoch]
         trajs = x[indices]
 
+        # simulate rollout
         for timestep in range(timesteps):
 
-            print(f"timestep {timestep}")
+            #print(f"timestep {timestep}")
 
-            current_timestep = trajs[:,-1,:-1]
-
-            actor_out = actor_model(current_timestep)
+            # get next traj
+            current_timestep = trajs[:,-1,:-1] # get all observation features (i.e. everything except action)
+            actor_out = actor(current_timestep)
             actions = torch.argmax(actor_out, dim=-1).unsqueeze(1)
             next_timestep = lstm(trajs[:, [timestep, timestep+1, timestep+2], :])
             next_timestep = torch.cat([next_timestep, actions], dim=1).unsqueeze(1)
             trajs = torch.cat([trajs, next_timestep], dim=1)
 
-            F.softmax(actor_out, dim=1)
+            # log action probs
+            probs = F.log_softmax(actor_out, dim=1)
+            action_probs = probs.gather(1, actions).squeeze(1)
+            batch_action_probs.append(action_probs)
 
-            print(current_timestep.shape)
-            print(next_timestep.shape)
+            # print(current_timestep.shape)
+            # print(next_timestep.shape)
 
-            reward = C1 * (next_timestep[:, 0, sofa_index] - current_timestep[:, sofa_index]) \
-                    + C2 * (next_timestep[:, 0, lactate_index] - current_timestep[:, lactate_index])
+            reward = (C1 * (next_timestep[:, 0, sofa_index] - current_timestep[:, sofa_index]) \
+                    + C2 * (next_timestep[:, 0, lactate_index] - current_timestep[:, lactate_index]))
             
-            rewards.append(reward)
+            batch_rewards.append(reward)
+        #print(torch.stack(batch_action_probs).T.shape)
+        
+        #batch_action_probs = torch.cat(batch_action_probs, dim=0)
+        #batch_rewards = torch.cat(batch_rewards, dim=0)
+        #batch_rewards = torch.tensor(batch_rewards, dtype=torch.float32)
+        #print(trajs.shape)
+        #print(batch_action_probs.shape)
+        #print(batch_rewards.shape)
+        #print(batch_obs.shape)
+        #trajs = trajs.reshape(-1, len(observation_action_cols))
+        #batch_rewards = batch_rewards.reshape()
+
+        # flatten so that we have [batch_size * timesteps, probs/rewards/features]
+        # fill in the first dimension batch-wise
+        batch_action_probs = torch.stack(batch_action_probs).T.reshape(-1).detach()
+        batch_rewards = torch.stack(batch_rewards).T.reshape(-1).detach()
+        batch_obs = trajs[:, 2:-1, :-1].reshape(-1, len(observation_cols)).detach()
+
+        #with torch.no_grad():
+        #V = critic(batch_obs).squeeze() # value
+        #A = (batch_rewards - V).detach() # advantage
+        A = (batch_rewards - critic(batch_obs).squeeze()).detach()
+
+        critic_criterion = nn.MSELoss()
+
+        torch.autograd.set_detect_anomaly(True)
+            
+        for i in range(num_iters):
+
+            V = critic(batch_obs).squeeze()
+            
+            actor_out = actor(batch_obs)
+            actions = torch.argmax(actor_out, dim=-1).unsqueeze(-1)
+            probs = F.log_softmax(actor_out, dim=1)
+            action_probs = probs.gather(1, actions).squeeze(1)
+
+            ratios = torch.exp(action_probs - batch_action_probs)
+            surr1 = ratios * A
+            surr2 = torch.clamp(ratios, 1 - epsilon, 1 + epsilon) * A
+            
+            actor_loss = (-torch.min(surr1, surr2)).mean()
+            critic_loss = critic_criterion(V, batch_rewards)
+
+            # Calculate gradients and perform backward propagation for actor & critic
+            actor_optim.zero_grad()
+            actor_loss.backward(retain_graph=True)
+            actor_optim.step()
+
+            critic_optim.zero_grad()
+            critic_loss.backward()
+            critic_optim.step()
+
+
+            print(f"Iteration {i+1}/{num_iters} of epoch {epoch+1}, actor loss: {actor_loss}, critic loss: {critic_loss}")
+    
+    torch.save(actor, "ppo_actor.pth")
 
 def main():
     #mlp_train()
