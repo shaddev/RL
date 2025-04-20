@@ -64,7 +64,6 @@ class EnvTransformer(nn.Module):
 
 
 df = pd.read_csv('../../data.csv')
-
 df_test = pd.read_csv('../../data_test.csv')
 
 observation_cols = ['o:gender', 'o:mechvent', 'o:max_dose_vaso', 'o:re_admission', 'o:age',
@@ -81,8 +80,7 @@ input_dim = len(observation_cols)
 hidden_dim = 64
 output_dim = np.max(df["a:action"]) + 1
 
-states = torch.tensor(df[observation_cols].values, dtype=torch.float32)
-actions = torch.tensor(df["a:action"].values, dtype=torch.int64)
+
 
 def get_sequences(seq_length, x_cols):
     sequences = []
@@ -103,10 +101,14 @@ def get_sequences(seq_length, x_cols):
     return x, y
 
 def mlp_train(use_saved = False):
+
+    states = torch.tensor(df[observation_cols].values, dtype=torch.float32)
+    actions = torch.tensor(df["a:action"].values, dtype=torch.int64)
+
     if use_saved:
         return torch.load("mlp.pth")
 
-    X_train, X_test, y_train, y_test = train_test_split(states, actions, test_size=0.2, random_state=42)
+    #X_train, X_test, y_train, y_test = train_test_split(states, actions, test_size=0.2, random_state=42)
 
     model = MLP(input_dim, hidden_dim, output_dim)
 
@@ -118,10 +120,10 @@ def mlp_train(use_saved = False):
 
     epochs = 200
     for epoch in range(epochs):
-        output = model(X_train)
+        output = model(states)
         #print(output.dtype)
         #print(actions)
-        loss = criterion(output, y_train)
+        loss = criterion(output, actions)
 
         optimizer.zero_grad()
         loss.backward()
@@ -168,19 +170,24 @@ def ppo_eval(model_file):
     # behavior_probs = mlp_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
 
     # KNN for behavior policy
-    knn = KNeighborsClassifier(n_neighbors=5)
-    knn.fit(states, actions)
-    print(knn.classes_)
-    behavior_probs = torch.tensor(knn.predict_proba(df_test[observation_cols]), dtype=torch.float32)
-    behavior_probs = behavior_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
-    print(behavior_probs.shape)
+    states_train = torch.tensor(df[observation_cols].values, dtype=torch.float32)
+    actions_train = torch.tensor(df["a:action"].values, dtype=torch.int64)
+    knn = KNeighborsClassifier(n_neighbors=50)
+    knn.fit(states_train, actions_train)
+    # print(knn.classes_)
+    behavior_probs = knn.predict_proba(df_test[observation_cols].values)
+    print(behavior_probs)
+    behavior_probs = behavior_probs[np.arange(behavior_probs.shape[0]), actions]
+    print(behavior_probs)
+    # behavior_probs = behavior_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    print(behavior_probs.size)
 
     ppo_actor = torch.load(model_file).eval()
     ppo_actor_out = ppo_actor(states)
     ppo_actor_probs = F.softmax(ppo_actor_out, dim=1)
-    ppo_actor_probs = ppo_actor_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    ppo_actor_probs = ppo_actor_probs.gather(1, actions.unsqueeze(1)).squeeze(1).detach().numpy()
 
-    rho_all = (ppo_actor_probs / (behavior_probs + 1e-8)).detach().numpy()
+    rho_all = (ppo_actor_probs / (behavior_probs + 1e-8))
 
     max_timesteps = df_test['step'].max() + 1
 
@@ -420,9 +427,9 @@ def ppo_train(env_type = "lstm"):
 def main():
     #mlp_train()
     #lstm_train()
-    #ppo_train("transformer")
+    #ppo_train("lstm")
     #mlp_eval()
-    #ppo_eval("ppo_actor_transformer.pth")
+    ppo_eval("ppo_actor_lstm.pth")
 
     #transformer_train()
 
