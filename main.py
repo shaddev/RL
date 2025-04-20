@@ -34,6 +34,34 @@ class EnvLSTM(nn.Module):
         x = self.relu(out[:, -1, :])
         x = self.lin(x)
         return x
+    
+class EnvTransformer(nn.Module):
+    def __init__(self, input_size, hidden_size, heads, num_layers, output_size):
+        super(EnvTransformer, self).__init__()
+
+        dropout = 0.1
+
+        self.lin = nn.Linear(input_size, hidden_size)
+
+        self.transformer = nn.Transformer(
+            d_model = hidden_size,
+            nhead = heads,
+            num_encoder_layers = num_layers,
+            dim_feedforward = 4 * hidden_size,
+            dropout = dropout
+        )
+
+        self.output = nn.Linear(hidden_size, output_size)
+    
+    def forward(self, x):
+
+        x = self.lin(x)
+        x = x.permute(1, 0, 2)
+        x = self.transformer(x, x)
+        x = x[-1, :, :]
+        x = self.output(x)
+        return x
+
 
 df = pd.read_csv('../../data.csv')
 
@@ -69,7 +97,11 @@ def get_sequences(seq_length, x_cols):
     
     x = torch.tensor(np.stack(sequences), dtype=torch.float32)
     y = torch.tensor(np.array(y), dtype=torch.float32)
-    return x, y
+
+
+    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=42)
+
+    return x_train, x_test, y_train, y_test
 
 def mlp_train(use_saved = False):
     if use_saved:
@@ -115,8 +147,6 @@ def mlp_eval():
     print(y[:200])
 
 
-
-
 def ppo_eval():
 
     # X_train, X_test, y_train, y_test = train_test_split(states, actions, test_size=0.2, random_state=42)
@@ -146,8 +176,6 @@ def ppo_eval():
     ppo_actor_probs = F.softmax(ppo_actor_out, dim=1)
     ppo_actor_probs = ppo_actor_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
 
-    print(mlp_probs.shape)
-
     rho_all = (ppo_actor_probs / (mlp_probs + 1e-8)).detach().numpy()
 
     max_timesteps = df['step'].max() + 1
@@ -172,8 +200,6 @@ def ppo_eval():
 
     # print(mlp_probs)
 
-
-
     # # Compute cumulative product of importance weights per time step
     w = torch.cumprod(torch.tensor(rho), dim=1)  # shape [N, H]
 
@@ -195,7 +221,7 @@ def lstm_train(use_saved = False):
 
     SEQ_LENGTH = 3
 
-    x,y = get_sequences(SEQ_LENGTH, observation_action_cols)
+    x, _, y, _ = get_sequences(SEQ_LENGTH, observation_action_cols)
 
     input_dim = len(observation_action_cols)
     output_dim = len(observation_cols)
@@ -223,6 +249,45 @@ def lstm_train(use_saved = False):
     torch.save(model, "lstm.pth")
     return model
 
+def transformer_train():
+
+    # if use_saved:
+    #     return torch.load("lstm.pth")
+
+    SEQ_LENGTH = 3
+
+    x, _, y, _ = get_sequences(SEQ_LENGTH, observation_action_cols)
+
+    input_dim = len(observation_action_cols)
+    output_dim = len(observation_cols)
+    hidden_dim = 64
+    num_heads = 4
+    num_layers = 2
+    model = EnvTransformer(input_dim, hidden_dim, num_heads, num_layers, output_dim)
+
+    lr = 0.01
+    weight_decay = 0.00001
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    criterion = nn.MSELoss()
+
+    epochs = 1000
+    for epoch in range(epochs):
+        output = model(x)
+        #print(output.dtype)
+        #print(output.shape)
+        loss = criterion(output, y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}')
+    
+    torch.save(model, "transformer.pth")
+    return model
+
+
 def ppo_train():
     C1 = -0.125
     C2 = -2
@@ -234,14 +299,14 @@ def ppo_train():
     # cov_var = torch.full(size=(25,), fill_value=0.5)
     # cov_mat = torch.diag(cov_var)
 
-    lstm = lstm_train(True)
+    env_model = torch.load("transformer.pth")
+    #env_model = lstm_train(True)
     actor = mlp_train(True)
     critic = MLP(input_dim, hidden_dim, 1)
     actor_optim = optim.Adam(actor.parameters(), lr=lr, weight_decay=weight_decay)
     critic_optim = optim.Adam(critic.parameters(), lr=lr, weight_decay=weight_decay)
 
-    lstm.eval()
-    #actor_model.eval()
+    env_model.eval()
 
     x, y = get_sequences(3, observation_action_cols)
 
@@ -273,11 +338,13 @@ def ppo_train():
             actor_out = actor(current_timestep)
 
             dist = Categorical(logits=actor_out)
-            actions = dist.sample()
+            actions = dist.sample().unsqueeze(1)
 
             #actions = torch.argmax(actor_out, dim=-1).unsqueeze(1)
-            print(actions.shape)
-            next_timestep = lstm(trajs[:, [timestep, timestep+1, timestep+2], :]).detach()
+            
+            next_timestep = env_model(trajs[:, [timestep, timestep+1, timestep+2], :]).detach()
+            # print(actions.shape) # uncomment for lstm
+            # print(next_timestep.shape)
             next_timestep = torch.cat([next_timestep, actions], dim=1).unsqueeze(1)
             trajs = torch.cat([trajs, next_timestep], dim=1)
 
@@ -351,9 +418,11 @@ def ppo_train():
 def main():
     #mlp_train()
     #lstm_train()
-    ppo_train()
+    #ppo_train()
     #mlp_eval()
-    #ppo_eval()
+    ppo_eval()
+
+    #transformer_train()
 
     # 38.7260856628418
 
