@@ -65,6 +65,8 @@ class EnvTransformer(nn.Module):
 
 df = pd.read_csv('../../data.csv')
 
+df_test = pd.read_csv('../../data_test.csv')
+
 observation_cols = ['o:gender', 'o:mechvent', 'o:max_dose_vaso', 'o:re_admission', 'o:age',
  'o:Weight_kg', 'o:GCS', 'o:HR', 'o:SysBP', 'o:MeanBP', 'o:DiaBP', 'o:RR', 'o:Temp_C',
 'o:FiO2_1', 'o:Potassium', 'o:Sodium', 'o:Chloride', 'o:Glucose', 'o:Magnesium', 'o:Calcium',
@@ -98,10 +100,7 @@ def get_sequences(seq_length, x_cols):
     x = torch.tensor(np.stack(sequences), dtype=torch.float32)
     y = torch.tensor(np.array(y), dtype=torch.float32)
 
-
-    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=42)
-
-    return x_train, x_test, y_train, y_test
+    return x, y
 
 def mlp_train(use_saved = False):
     if use_saved:
@@ -147,43 +146,48 @@ def mlp_eval():
     print(y[:200])
 
 
-def ppo_eval():
+def ppo_eval(model_file):
 
     # X_train, X_test, y_train, y_test = train_test_split(states, actions, test_size=0.2, random_state=42)
 
-    # KNN for behavior policy
-    # knn = KNeighborsClassifier(n_neighbors=5)
-    # knn.fit(X_train, y_train)
-
     C1 = -0.125
     C2 = -2
-    terminal_rewards = torch.tensor(df["r:reward"].values, dtype=torch.float32)
-    dones = torch.tensor(df["r:reward"].values != 0, dtype=torch.float32)
-    r_states = torch.tensor(df[["o:SOFA","o:Arterial_lactate", "traj", "step"]].values, dtype=torch.float32)
+    states = torch.tensor(df_test[observation_cols].values, dtype=torch.float32)
+    actions = torch.tensor(df_test["a:action"].values, dtype=torch.int64)
+    terminal_rewards = torch.tensor(df_test["r:reward"].values, dtype=torch.float32)
+    dones = torch.tensor(df_test["r:reward"].values != 0, dtype=torch.float32)
+    r_states = torch.tensor(df_test[["o:SOFA","o:Arterial_lactate", "traj", "step"]].values, dtype=torch.float32)
     next_states = torch.cat((torch.zeros(1, 4), r_states[:-1]))
     rewards = C1 * (next_states[:, 0] - r_states[:, 0]) + C2 * np.tanh(next_states[:, 1] - r_states[:, 1])
     rewards[dones == 1] = 15 * terminal_rewards[dones == 1]
-    
-    mlp = torch.load("mlp.pth").eval()
-    ppo_actor = torch.load("ppo_actor.pth").eval()
 
-    mlp_out = mlp(states)
+    # MLP for behavior policy
+    # mlp = torch.load("mlp.pth").eval()
+    # mlp_out = mlp(states)
+    # mlp_probs = F.softmax(mlp_out, dim=1)
+    # behavior_probs = mlp_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+    # KNN for behavior policy
+    knn = KNeighborsClassifier(n_neighbors=5)
+    knn.fit(states, actions)
+    print(knn.classes_)
+    behavior_probs = torch.tensor(knn.predict_proba(df_test[observation_cols]), dtype=torch.float32)
+    behavior_probs = behavior_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    print(behavior_probs.shape)
+
+    ppo_actor = torch.load(model_file).eval()
     ppo_actor_out = ppo_actor(states)
-
-    mlp_probs = F.softmax(mlp_out, dim=1)
-    mlp_probs = mlp_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
-
     ppo_actor_probs = F.softmax(ppo_actor_out, dim=1)
     ppo_actor_probs = ppo_actor_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
 
-    rho_all = (ppo_actor_probs / (mlp_probs + 1e-8)).detach().numpy()
+    rho_all = (ppo_actor_probs / (behavior_probs + 1e-8)).detach().numpy()
 
-    max_timesteps = df['step'].max() + 1
+    max_timesteps = df_test['step'].max() + 1
 
     rho = []
     all_rewards = []
     cur_step = 0
-    for traj_id, group in df.groupby('traj'):
+    for traj_id, group in df_test.groupby('traj'):
 
         rew = rewards[cur_step : cur_step + len(group)]
         rew = np.pad(rew, (0, max_timesteps - len(group)), mode='constant')
@@ -211,8 +215,6 @@ def ppo_eval():
 
     print(f"final score = {phwis}")
 
-    
-
 
 def lstm_train(use_saved = False):
 
@@ -221,7 +223,7 @@ def lstm_train(use_saved = False):
 
     SEQ_LENGTH = 3
 
-    x, _, y, _ = get_sequences(SEQ_LENGTH, observation_action_cols)
+    x, y = get_sequences(SEQ_LENGTH, observation_action_cols)
 
     input_dim = len(observation_action_cols)
     output_dim = len(observation_cols)
@@ -256,22 +258,22 @@ def transformer_train():
 
     SEQ_LENGTH = 3
 
-    x, _, y, _ = get_sequences(SEQ_LENGTH, observation_action_cols)
+    x, y = get_sequences(SEQ_LENGTH, observation_action_cols)
 
     input_dim = len(observation_action_cols)
     output_dim = len(observation_cols)
     hidden_dim = 64
     num_heads = 4
-    num_layers = 2
+    num_layers = 3
     model = EnvTransformer(input_dim, hidden_dim, num_heads, num_layers, output_dim)
 
-    lr = 0.01
+    lr = 0.001
     weight_decay = 0.00001
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     criterion = nn.MSELoss()
 
-    epochs = 1000
+    epochs = 200
     for epoch in range(epochs):
         output = model(x)
         #print(output.dtype)
@@ -288,7 +290,7 @@ def transformer_train():
     return model
 
 
-def ppo_train():
+def ppo_train(env_type = "lstm"):
     C1 = -0.125
     C2 = -2
     gamma = 0.9
@@ -296,11 +298,11 @@ def ppo_train():
     lr = 0.0001
     weight_decay = 0.00001
 
-    # cov_var = torch.full(size=(25,), fill_value=0.5)
-    # cov_mat = torch.diag(cov_var)
-
-    env_model = torch.load("transformer.pth")
-    #env_model = lstm_train(True)
+    if env_type == "lstm":
+        env_model = lstm_train(True)
+    else:
+        env_model = torch.load("transformer.pth")
+    
     actor = mlp_train(True)
     critic = MLP(input_dim, hidden_dim, 1)
     actor_optim = optim.Adam(actor.parameters(), lr=lr, weight_decay=weight_decay)
@@ -413,18 +415,20 @@ def ppo_train():
 
             print(f"Iteration {i+1}/{num_iters} of epoch {epoch+1}, actor loss: {actor_loss}, critic loss: {critic_loss}")
     
-    torch.save(actor, "ppo_actor.pth")
+    torch.save(actor, f"ppo_actor_{env_type}.pth")
 
 def main():
     #mlp_train()
     #lstm_train()
-    #ppo_train()
+    #ppo_train("transformer")
     #mlp_eval()
-    ppo_eval()
+    #ppo_eval("ppo_actor_transformer.pth")
 
     #transformer_train()
 
-    # 38.7260856628418
+    # LSTM - final score = 27.956998825073242
+    # Transformer - final score = 12.839700698852539
+    #               final score = 26.4208927154541
 
 main()
     
