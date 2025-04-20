@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.distributions import Categorical, MultivariateNormal
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 
@@ -230,6 +231,9 @@ def ppo_train():
     lr = 0.0001
     weight_decay = 0.00001
 
+    # cov_var = torch.full(size=(25,), fill_value=0.5)
+    # cov_mat = torch.diag(cov_var)
+
     lstm = lstm_train(True)
     actor = mlp_train(True)
     critic = MLP(input_dim, hidden_dim, 1)
@@ -267,7 +271,12 @@ def ppo_train():
             # get next traj
             current_timestep = trajs[:,-1,:-1] # get all observation features (i.e. everything except action)
             actor_out = actor(current_timestep)
-            actions = torch.argmax(actor_out, dim=-1).unsqueeze(1)
+
+            dist = Categorical(logits=actor_out)
+            actions = dist.sample()
+
+            #actions = torch.argmax(actor_out, dim=-1).unsqueeze(1)
+            print(actions.shape)
             next_timestep = lstm(trajs[:, [timestep, timestep+1, timestep+2], :]).detach()
             next_timestep = torch.cat([next_timestep, actions], dim=1).unsqueeze(1)
             trajs = torch.cat([trajs, next_timestep], dim=1)
@@ -342,9 +351,11 @@ def ppo_train():
 def main():
     #mlp_train()
     #lstm_train()
-    #ppo_train()
+    ppo_train()
     #mlp_eval()
-    ppo_eval()
+    #ppo_eval()
+
+    # 38.7260856628418
 
 main()
     
