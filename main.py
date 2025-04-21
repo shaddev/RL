@@ -176,6 +176,8 @@ def ppo_eval(model_file):
     rewards = C1 * (next_states[:, 0] - r_states[:, 0]) + C2 * np.tanh(next_states[:, 1] - r_states[:, 1])
     rewards[dones == 1] = 15 * terminal_rewards[dones == 1]
 
+    N = len(df_test.groupby("traj"))
+
     print(dones[:50])
     print(rewards[:50])
 
@@ -236,7 +238,7 @@ def ppo_eval(model_file):
     numerator = (w * all_rewards).sum(dim=0)     # shape [H]
     denominator = w.sum(dim=0) + 1e-8        # avoid div-by-zero
 
-    phwis = (numerator / denominator).sum()  # scalar estimate
+    phwis = (numerator / denominator).sum() / N  # scalar estimate
 
     print(f"final score = {phwis}")
 
@@ -509,14 +511,90 @@ def fqi():
     
     return Q_models
 
-def phwdr():
+def phwdr(model_file):
+    
+    C1 = -0.125
+    C2 = -2
+    states = torch.tensor(df_test[observation_cols].values, dtype=torch.float32)
+    actions = torch.tensor(df_test["a:action"].values, dtype=torch.int64)
+    terminal_rewards = torch.tensor(df_test["r:reward"].values, dtype=torch.float32)
+    
+    r_states = torch.tensor(df_test[["o:SOFA","o:Arterial_lactate", "r:reward"]].values, dtype=torch.float32)
+    next_states = torch.cat((torch.zeros(1, 3), r_states[:-1]))
+    prev_states = torch.cat((r_states[1:], torch.zeros(1, 3)))
+    dones = prev_states[:, 2] != 0
+    rewards = C1 * (next_states[:, 0] - r_states[:, 0]) + C2 * np.tanh(next_states[:, 1] - r_states[:, 1])
+    rewards[dones == 1] = 15 * terminal_rewards[dones == 1]
 
+    N = len(df_test.groupby("traj"))
+
+    # Random Forests for behavior policy
     with open('forest.pkl', 'rb') as f:
         q_models = pickle.load(f)
     
+    behavior_preds = np.array([q_models[a].predict(states) for a in range(25)]).T
+
+    behavior_probs = behavior_preds - np.max(behavior_preds, axis=1)[:, np.newaxis]
+    exps = np.exp(behavior_probs)
+    behavior_probs = exps / np.sum(exps, axis=1)[:, np.newaxis]
+
+    behavior_preds_actions = behavior_preds[np.arange(behavior_preds.shape[0]), actions]
+    behavior_probs_actions = behavior_preds[np.arange(behavior_probs.shape[0]), actions]
+
+    print(behavior_probs.shape)
+    ppo_actor = torch.load(model_file).eval()
+    ppo_actor_out = ppo_actor(states)
+    ppo_actor_probs = F.softmax(ppo_actor_out, dim=1)
+    ppo_actor_probs = ppo_actor_probs.gather(1, actions.unsqueeze(1)).squeeze(1).detach().numpy()
+
+    rho_all = (ppo_actor_probs / (behavior_probs_actions + 1e-8))
+
+    max_timesteps = df_test['step'].max()
     
+    all_qsa = []
+    rho = []
+    all_rewards = []
 
+    all_vs = []
+    
+    cur_step = 0
+    for traj_id, group in df_test.groupby('traj'):
 
+        num_states = len(group) - 1 # all states except terminal one have a reward
+
+        rew = rewards[cur_step : cur_step + num_states]
+        rew = np.pad(rew, (0, max_timesteps - num_states), mode='constant')
+        all_rewards.append(rew)
+
+        rho_group = rho_all[cur_step : cur_step + num_states]
+        rho_group = np.pad(rho_group, (0, max_timesteps - num_states), mode='constant')
+        rho.append(rho_group)
+
+        qsa_group = behavior_preds_actions[cur_step : cur_step + num_states]
+        qsa_group = np.pad(qsa_group, (0, max_timesteps - num_states), mode='constant')
+        all_qsa.append(qsa_group)
+
+        vs_group = [behavior_preds[i] @ behavior_probs[i] for i in range(cur_step, cur_step + num_states + 1)]
+        vs_group = np.pad(vs_group, (0, max_timesteps - num_states), mode='constant')
+        all_vs.append(vs_group)
+
+        cur_step += len(group)
+    
+    rho = np.stack(rho)
+    all_rewards = np.stack(all_rewards)
+
+    w = torch.cumprod(torch.tensor(rho), dim=1)
+
+    numerator = (w * (all_rewards - all_qsa)).sum(dim=0)
+    denominator = w.sum(dim=0) + 1e-8
+
+    sum_1 = (numerator / denominator).sum() / N
+
+    sum_2 = np.sum(vs_group) / N
+
+    score = sum_1 + sum_2
+
+    print(f"phwdr score = {score}")
 
 def main():
     #mlp_train()
@@ -524,10 +602,12 @@ def main():
     #ppo_train("lstm")
     #mlp_eval()
     #ppo_eval("ppo_actor_transformer.pth")
+    phwdr("ppo_actor_transformer.pth")
 
     #transformer_train()
 
-    fqi()
+    #fqi()
+    #phwdr()
 
     # LSTM - final score = 27.956998825073242
     # Transformer - final score = 12.839700698852539
