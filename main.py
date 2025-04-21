@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestRegressor
 from collections import defaultdict
+import pickle
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -448,25 +449,27 @@ def fqi():
     num_iterations = 10
     gamma = 0.99  # discount factor
 
-    # Assume: states, actions, rewards, next_states from dataset
-    # states: N x state_dim
-    # actions: N x 1
-    # rewards: N x 1
-    # next_states: N x state_dim
-    # action_space = [0, 1, ..., A-1]
-
+    C1 = -0.125
+    C2 = -2
     states = torch.tensor(df[observation_cols].values, dtype=torch.float32)
     actions = torch.tensor(df["a:action"].values, dtype=torch.int64)
 
     next_states = torch.cat((torch.zeros(1, len(observation_cols)), states[:-1]))
-    dones = torch.tensor(df["r:reward"].values != 0, dtype=torch.float32)
-    #next_states[dones == 1] = states[dones == 1]
+    r_states = torch.tensor(df[["o:SOFA","o:Arterial_lactate", "r:reward"]].values, dtype=torch.float32)
+    prev_states = torch.cat((r_states[1:], torch.zeros(1, 3)))
+    terminal_rewards = torch.tensor(df["r:reward"].values, dtype=torch.float32)
+    
+    terminals = r_states[:, 2] == 1
 
-    r_states = torch.tensor(df[["o:SOFA","o:Arterial_lactate", "traj", "step"]].values, dtype=torch.float32)
+    dones = prev_states[:, 2] != 0
     rewards = C1 * (next_states[:, 0] - r_states[:, 0]) + C2 * np.tanh(next_states[:, 1] - r_states[:, 1])
     rewards[dones == 1] = 15 * terminal_rewards[dones == 1]
 
-    Q_models = {a: RandomForestRegressor(n_estimators=80) for a in action_space}
+    # states = states[terminals != 1]
+    # actions = actions[terminals != 1]
+    # rewards = rewards[terminals != 1]
+
+    Q_models = {a: RandomForestRegressor(n_estimators=50) for a in range(25)}
 
     # Initial Q values = 0
     Q_values = np.zeros(len(states))
@@ -476,20 +479,19 @@ def fqi():
         targets = []
         features = []
         for a in range(25):
-            indices = actions == a
+            print(f"Iteration {iteration} Action {a}")
+            indices = torch.logical_and(actions == a, terminals != 1)
 
-            terminals = torch.logical_and(actions == a, dones == 1)
-            nonterminals = torch.logical_and(actions == a, dones != 1)
+            if not indices.any():
+                raise RuntimeError("no actions")
 
-            s_terminals = states[indices]
-            s_next_terminals = next_states[indices]
+            s = states[indices]
+            s_next = next_states[indices]
             r = rewards[indices]
-
-
 
             # Estimate max_a' Q(s', a') from previous iteration
             max_next_Q = np.zeros(len(s_next))
-            for a_prime in action_space:
+            for a_prime in range(25):
                 if iteration > 0:
                     max_next_Q = np.maximum(
                         max_next_Q,
@@ -501,6 +503,19 @@ def fqi():
 
             # Fit Q_model[a] with (s, y)
             Q_models[a].fit(X, y)
+        
+    with open('forest.pkl', 'wb') as f:
+        pickle.dump(Q_models, f)
+    
+    return Q_models
+
+def phwdr():
+
+    with open('forest.pkl', 'rb') as f:
+        q_models = pickle.load(f)
+    
+    
+
 
 
 def main():
@@ -508,9 +523,11 @@ def main():
     #lstm_train()
     #ppo_train("lstm")
     #mlp_eval()
-    ppo_eval("ppo_actor_transformer.pth")
+    #ppo_eval("ppo_actor_transformer.pth")
 
     #transformer_train()
+
+    fqi()
 
     # LSTM - final score = 27.956998825073242
     # Transformer - final score = 12.839700698852539
