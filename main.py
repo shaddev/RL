@@ -7,6 +7,8 @@ import torch.optim as optim
 from torch.distributions import Categorical, MultivariateNormal
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestRegressor
+from collections import defaultdict
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -63,8 +65,18 @@ class EnvTransformer(nn.Module):
         return x
 
 
-df = pd.read_csv('../../data.csv')
-df_test = pd.read_csv('../../data_test.csv')
+df = pd.read_csv('../../data_filtered.csv')
+df_test = pd.read_csv('../../data_test_filtered.csv')
+
+# Filter out trajs of size 1
+# filtered_groups = df.groupby('traj').size() 
+# filtered_groups = filtered_groups[filtered_groups == 1].index
+# df = df[~df.isin(filtered_groups)]
+# df.to_csv('data_filtered.csv', index=False)
+# filtered_groups = df_test.groupby('traj').size()
+# filtered_groups = filtered_groups[filtered_groups == 1].index
+# df_test = df_test[~df_test.isin(filtered_groups)]
+# df_test.to_csv('data_test_filtered.csv', index=False)
 
 observation_cols = ['o:gender', 'o:mechvent', 'o:max_dose_vaso', 'o:re_admission', 'o:age',
  'o:Weight_kg', 'o:GCS', 'o:HR', 'o:SysBP', 'o:MeanBP', 'o:DiaBP', 'o:RR', 'o:Temp_C',
@@ -79,8 +91,6 @@ observation_action_cols = observation_cols + ["a:action"]
 input_dim = len(observation_cols)
 hidden_dim = 64
 output_dim = np.max(df["a:action"]) + 1
-
-
 
 def get_sequences(seq_length, x_cols):
     sequences = []
@@ -157,30 +167,35 @@ def ppo_eval(model_file):
     states = torch.tensor(df_test[observation_cols].values, dtype=torch.float32)
     actions = torch.tensor(df_test["a:action"].values, dtype=torch.int64)
     terminal_rewards = torch.tensor(df_test["r:reward"].values, dtype=torch.float32)
-    dones = torch.tensor(df_test["r:reward"].values != 0, dtype=torch.float32)
-    r_states = torch.tensor(df_test[["o:SOFA","o:Arterial_lactate", "traj", "step"]].values, dtype=torch.float32)
-    next_states = torch.cat((torch.zeros(1, 4), r_states[:-1]))
+    
+    r_states = torch.tensor(df_test[["o:SOFA","o:Arterial_lactate", "r:reward"]].values, dtype=torch.float32)
+    next_states = torch.cat((torch.zeros(1, 3), r_states[:-1]))
+    prev_states = torch.cat((r_states[1:], torch.zeros(1, 3)))
+    dones = prev_states[:, 2] != 0
     rewards = C1 * (next_states[:, 0] - r_states[:, 0]) + C2 * np.tanh(next_states[:, 1] - r_states[:, 1])
     rewards[dones == 1] = 15 * terminal_rewards[dones == 1]
 
+    print(dones[:50])
+    print(rewards[:50])
+
     # MLP for behavior policy
-    # mlp = torch.load("mlp.pth").eval()
-    # mlp_out = mlp(states)
-    # mlp_probs = F.softmax(mlp_out, dim=1)
-    # behavior_probs = mlp_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    mlp = torch.load("mlp.pth").eval()
+    mlp_out = mlp(states)
+    mlp_probs = F.softmax(mlp_out, dim=1)
+    behavior_probs = mlp_probs.gather(1, actions.unsqueeze(1)).squeeze(1).detach().numpy()
 
     # KNN for behavior policy
-    states_train = torch.tensor(df[observation_cols].values, dtype=torch.float32)
-    actions_train = torch.tensor(df["a:action"].values, dtype=torch.int64)
-    knn = KNeighborsClassifier(n_neighbors=50)
-    knn.fit(states_train, actions_train)
-    # print(knn.classes_)
-    behavior_probs = knn.predict_proba(df_test[observation_cols].values)
-    print(behavior_probs)
-    behavior_probs = behavior_probs[np.arange(behavior_probs.shape[0]), actions]
-    print(behavior_probs)
-    # behavior_probs = behavior_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
-    print(behavior_probs.size)
+    # states_train = torch.tensor(df[observation_cols].values, dtype=torch.float32)
+    # actions_train = torch.tensor(df["a:action"].values, dtype=torch.int64)
+    # knn = KNeighborsClassifier(n_neighbors=50)
+    # knn.fit(states_train, actions_train)
+    # # print(knn.classes_)
+    # behavior_probs = knn.predict_proba(df_test[observation_cols].values)
+    # print(behavior_probs)
+    # behavior_probs = behavior_probs[np.arange(behavior_probs.shape[0]), actions]
+    # print(behavior_probs)
+    # # behavior_probs = behavior_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    # print(behavior_probs.size)
 
     ppo_actor = torch.load(model_file).eval()
     ppo_actor_out = ppo_actor(states)
@@ -189,19 +204,21 @@ def ppo_eval(model_file):
 
     rho_all = (ppo_actor_probs / (behavior_probs + 1e-8))
 
-    max_timesteps = df_test['step'].max() + 1
+    max_timesteps = df_test['step'].max()
 
     rho = []
     all_rewards = []
     cur_step = 0
     for traj_id, group in df_test.groupby('traj'):
 
-        rew = rewards[cur_step : cur_step + len(group)]
-        rew = np.pad(rew, (0, max_timesteps - len(group)), mode='constant')
+        num_states = len(group) - 1 # all states except terminal one have a reward
+
+        rew = rewards[cur_step : cur_step + num_states]
+        rew = np.pad(rew, (0, max_timesteps - num_states), mode='constant')
         all_rewards.append(rew)
 
-        rho_group = rho_all[cur_step : cur_step + len(group)]
-        rho_group = np.pad(rho_group, (0, max_timesteps - len(group)), mode='constant')
+        rho_group = rho_all[cur_step : cur_step + num_states]
+        rho_group = np.pad(rho_group, (0, max_timesteps - num_states), mode='constant')
         rho.append(rho_group)
 
         cur_step += len(group)
@@ -312,8 +329,8 @@ def ppo_train(env_type = "lstm"):
     
     actor = mlp_train(True)
     critic = MLP(input_dim, hidden_dim, 1)
-    actor_optim = optim.Adam(actor.parameters(), lr=lr, weight_decay=weight_decay)
-    critic_optim = optim.Adam(critic.parameters(), lr=lr, weight_decay=weight_decay)
+    actor_optim = optim.Adam(actor.parameters(), lr=lr, weight_decay=weight_decay, eps=1e-5)
+    critic_optim = optim.Adam(critic.parameters(), lr=lr, weight_decay=weight_decay, eps=1e-5)
 
     env_model.eval()
 
@@ -424,18 +441,82 @@ def ppo_train(env_type = "lstm"):
     
     torch.save(actor, f"ppo_actor_{env_type}.pth")
 
+def fqi():
+
+    # Initialize
+    Q_models = {}  # One model per action
+    num_iterations = 10
+    gamma = 0.99  # discount factor
+
+    # Assume: states, actions, rewards, next_states from dataset
+    # states: N x state_dim
+    # actions: N x 1
+    # rewards: N x 1
+    # next_states: N x state_dim
+    # action_space = [0, 1, ..., A-1]
+
+    states = torch.tensor(df[observation_cols].values, dtype=torch.float32)
+    actions = torch.tensor(df["a:action"].values, dtype=torch.int64)
+
+    next_states = torch.cat((torch.zeros(1, len(observation_cols)), states[:-1]))
+    dones = torch.tensor(df["r:reward"].values != 0, dtype=torch.float32)
+    #next_states[dones == 1] = states[dones == 1]
+
+    r_states = torch.tensor(df[["o:SOFA","o:Arterial_lactate", "traj", "step"]].values, dtype=torch.float32)
+    rewards = C1 * (next_states[:, 0] - r_states[:, 0]) + C2 * np.tanh(next_states[:, 1] - r_states[:, 1])
+    rewards[dones == 1] = 15 * terminal_rewards[dones == 1]
+
+    Q_models = {a: RandomForestRegressor(n_estimators=80) for a in action_space}
+
+    # Initial Q values = 0
+    Q_values = np.zeros(len(states))
+
+    for iteration in range(num_iterations):
+        # Target values for training
+        targets = []
+        features = []
+        for a in range(25):
+            indices = actions == a
+
+            terminals = torch.logical_and(actions == a, dones == 1)
+            nonterminals = torch.logical_and(actions == a, dones != 1)
+
+            s_terminals = states[indices]
+            s_next_terminals = next_states[indices]
+            r = rewards[indices]
+
+
+
+            # Estimate max_a' Q(s', a') from previous iteration
+            max_next_Q = np.zeros(len(s_next))
+            for a_prime in action_space:
+                if iteration > 0:
+                    max_next_Q = np.maximum(
+                        max_next_Q,
+                        Q_models[a_prime].predict(s_next)
+                    )
+
+            y = r + gamma * max_next_Q
+            X = s  # current state is input
+
+            # Fit Q_model[a] with (s, y)
+            Q_models[a].fit(X, y)
+
+
 def main():
     #mlp_train()
     #lstm_train()
     #ppo_train("lstm")
     #mlp_eval()
-    ppo_eval("ppo_actor_lstm.pth")
+    ppo_eval("ppo_actor_transformer.pth")
 
     #transformer_train()
 
     # LSTM - final score = 27.956998825073242
     # Transformer - final score = 12.839700698852539
     #               final score = 26.4208927154541
+
+    #print(df.groupby('traj').size().min())
 
 main()
     
