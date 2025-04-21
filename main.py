@@ -65,6 +65,41 @@ class EnvTransformer(nn.Module):
         x = self.output(x)
         return x
 
+class MixStrategy(nn.Module):
+
+    def __init__(self, mlp, ppo, low = "mlp", med = "ppo", high = "mlp"):
+        super(MixStrategy, self).__init__()
+        self.mlp = mlp
+        self.ppo = ppo
+
+        # define strategy
+        self.low = low
+        self.med = med
+        self.high = high
+
+        self.low_threshold = -0.5
+        self.high_threshold = 0.5
+
+        self.sofa_index = observation_cols.index('o:SOFA')
+    
+    def forward(self, x):
+
+        sofas = x[:, self.sofa_index]
+        low_indices = sofas < self.low_threshold
+        high_indices = sofas > self.high_threshold
+        med_indices = ~ (low_indices | high_indices)
+
+        out = self.mlp(x)
+        ppo_out = self.ppo(x)
+
+        if self.low == "ppo":
+            out[low_indices] = ppo_out[low_indices]
+        if self.med == "ppo":
+            out[med_indices] = ppo_out[med_indices]
+        if self.high == "ppo":
+            out[high_indices] = ppo_out[high_indices]
+        
+        return out
 
 df = pd.read_csv('../../data_filtered.csv')
 df_test = pd.read_csv('../../data_test_filtered.csv')
@@ -159,7 +194,7 @@ def mlp_eval():
     print(y[:200])
 
 
-def ppo_eval(model_file):
+def ppo_eval(model_file, use_mix = False):
 
     # X_train, X_test, y_train, y_test = train_test_split(states, actions, test_size=0.2, random_state=42)
 
@@ -178,29 +213,29 @@ def ppo_eval(model_file):
 
     N = len(df_test.groupby("traj"))
 
-    print(dones[:50])
-    print(rewards[:50])
-
     # MLP for behavior policy
     mlp = torch.load("mlp.pth").eval()
-    mlp_out = mlp(states)
-    mlp_probs = F.softmax(mlp_out, dim=1)
-    behavior_probs = mlp_probs.gather(1, actions.unsqueeze(1)).squeeze(1).detach().numpy()
+    # mlp_out = mlp(states)
+    # mlp_probs = F.softmax(mlp_out, dim=1)
+    # behavior_probs = mlp_probs.gather(1, actions.unsqueeze(1)).squeeze(1).detach().numpy()
 
     # KNN for behavior policy
-    # states_train = torch.tensor(df[observation_cols].values, dtype=torch.float32)
-    # actions_train = torch.tensor(df["a:action"].values, dtype=torch.int64)
-    # knn = KNeighborsClassifier(n_neighbors=50)
-    # knn.fit(states_train, actions_train)
-    # # print(knn.classes_)
-    # behavior_probs = knn.predict_proba(df_test[observation_cols].values)
-    # print(behavior_probs)
-    # behavior_probs = behavior_probs[np.arange(behavior_probs.shape[0]), actions]
-    # print(behavior_probs)
-    # # behavior_probs = behavior_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
-    # print(behavior_probs.size)
+    states_train = torch.tensor(df[observation_cols].values, dtype=torch.float32)
+    actions_train = torch.tensor(df["a:action"].values, dtype=torch.int64)
+    knn = KNeighborsClassifier(n_neighbors=50)
+    knn.fit(states_train, actions_train)
+    behavior_probs = knn.predict_proba(df_test[observation_cols].values)
+    behavior_probs = behavior_probs[np.arange(behavior_probs.shape[0]), actions]
 
-    ppo_actor = torch.load(model_file).eval()
+    saved_ppo_actor = torch.load(model_file)
+
+    if use_mix:
+        ppo_actor = MixStrategy(mlp, saved_ppo_actor)
+    else:
+        ppo_actor = saved_ppo_actor
+    
+    ppo_actor.eval()
+
     ppo_actor_out = ppo_actor(states)
     ppo_actor_probs = F.softmax(ppo_actor_out, dim=1)
     ppo_actor_probs = ppo_actor_probs.gather(1, actions.unsqueeze(1)).squeeze(1).detach().numpy()
@@ -601,8 +636,8 @@ def main():
     #lstm_train()
     #ppo_train("lstm")
     #mlp_eval()
-    #ppo_eval("ppo_actor_transformer.pth")
-    phwdr("ppo_actor_transformer.pth")
+    ppo_eval("ppo_actor_transformer.pth", True)
+    #phwdr("ppo_actor_transformer.pth")
 
     #transformer_train()
 
