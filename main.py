@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical, MultivariateNormal
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestRegressor
 from collections import defaultdict
@@ -214,7 +215,7 @@ def ppo_eval(model_file, use_mix = False):
     N = len(df_test.groupby("traj"))
 
     # MLP for behavior policy
-    mlp = torch.load("mlp.pth").eval()
+    mlp = torch.load("mlp.pth")
     # mlp_out = mlp(states)
     # mlp_probs = F.softmax(mlp_out, dim=1)
     # behavior_probs = mlp_probs.gather(1, actions.unsqueeze(1)).squeeze(1).detach().numpy()
@@ -546,7 +547,7 @@ def fqi():
     
     return Q_models
 
-def phwdr(model_file):
+def phwdr(model_file, use_mix = False):
     
     C1 = -0.125
     C2 = -2
@@ -577,7 +578,16 @@ def phwdr(model_file):
     behavior_probs_actions = behavior_preds[np.arange(behavior_probs.shape[0]), actions]
 
     print(behavior_probs.shape)
-    ppo_actor = torch.load(model_file).eval()
+    saved_ppo_actor = torch.load(model_file)
+
+    if use_mix:
+        mlp = torch.load("mlp.pth")
+        ppo_actor = MixStrategy(mlp, saved_ppo_actor)
+    else:
+        ppo_actor = saved_ppo_actor
+    
+    ppo_actor.eval()
+
     ppo_actor_out = ppo_actor(states)
     ppo_actor_probs = F.softmax(ppo_actor_out, dim=1)
     ppo_actor_probs = ppo_actor_probs.gather(1, actions.unsqueeze(1)).squeeze(1).detach().numpy()
@@ -631,13 +641,42 @@ def phwdr(model_file):
 
     print(f"phwdr score = {score}")
 
+def split_dataset(max_traj_id = 5000):
+
+    df = pd.read_csv('../../sepsis_final_data_withTimes.csv')
+
+    filtered_groups = df.groupby('traj').size() 
+    filtered_groups = filtered_groups[filtered_groups == 1].index
+    df = df[~df.isin(filtered_groups)]
+
+    df = df[df['traj'] <= max_traj_id]
+
+    groups = df['traj']
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+
+    train_idx, test_idx = next(gss.split(df, groups=groups))
+
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    test_df = df.iloc[test_idx].reset_index(drop=True)
+
+    valid = len(set(train_df['a:action'].unique())) == 25 and len(set(test_df['a:action'].unique())) == 25
+    train_trajs = len(train_df['traj'].unique())
+    test_trajs = len(test_df['traj'].unique())
+    print(f"Train trajs: {train_trajs}, Test trajs: {test_trajs}")
+    print(f"Split is valid: {valid}")
+
+    train_df.to_csv('data_filtered_train.csv', index=False)
+    test_df.to_csv('data_filtered_test.csv', index=False)
+
+
 def main():
     #mlp_train()
     #lstm_train()
     #ppo_train("lstm")
     #mlp_eval()
-    ppo_eval("ppo_actor_transformer.pth", True)
-    #phwdr("ppo_actor_transformer.pth")
+    #ppo_eval("ppo_actor_transformer.pth", True)
+    #phwdr("ppo_actor_lstm.pth", True)
+    split_dataset()
 
     #transformer_train()
 
