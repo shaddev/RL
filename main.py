@@ -11,6 +11,10 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestRegressor
 from collections import defaultdict
 import pickle
+import warnings
+
+warnings.filterwarnings("ignore")
+
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -68,15 +72,13 @@ class EnvTransformer(nn.Module):
 
 class MixStrategy(nn.Module):
 
-    def __init__(self, mlp, ppo, low = "mlp", med = "ppo", high = "mlp"):
+    def __init__(self, mlp, ppo, combination = ("ppo", "ppo","ppo")):
         super(MixStrategy, self).__init__()
         self.mlp = mlp
         self.ppo = ppo
 
         # define strategy
-        self.low = low
-        self.med = med
-        self.high = high
+        self.low, self.med, self.high = combination
 
         self.low_threshold = -0.5
         self.high_threshold = 0.5
@@ -102,8 +104,12 @@ class MixStrategy(nn.Module):
         
         return out
 
-df = pd.read_csv('../../data_filtered.csv')
-df_test = pd.read_csv('../../data_test_filtered.csv')
+df = pd.read_csv('data_filtered_train.csv')
+df_test = pd.read_csv('data_filtered_test.csv')
+
+GPU_ID = 1
+device = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
+#device = 'cpu'
 
 # Filter out trajs of size 1
 # filtered_groups = df.groupby('traj').size() 
@@ -195,7 +201,7 @@ def mlp_eval():
     print(y[:200])
 
 
-def ppo_eval(model_file, use_mix = False):
+def ppo_eval(model_file, use_mix = False, combination = ("ppo", "ppo","ppo")):
 
     # X_train, X_test, y_train, y_test = train_test_split(states, actions, test_size=0.2, random_state=42)
 
@@ -225,17 +231,22 @@ def ppo_eval(model_file, use_mix = False):
     actions_train = torch.tensor(df["a:action"].values, dtype=torch.int64)
     knn = KNeighborsClassifier(n_neighbors=50)
     knn.fit(states_train, actions_train)
+    #print("Trained KNN")
     behavior_probs = knn.predict_proba(df_test[observation_cols].values)
+    #print("KNN prediction complete")
     behavior_probs = behavior_probs[np.arange(behavior_probs.shape[0]), actions]
 
-    saved_ppo_actor = torch.load(model_file)
+    saved_ppo_actor = torch.load(model_file, map_location='cpu')
 
     if use_mix:
-        ppo_actor = MixStrategy(mlp, saved_ppo_actor)
+        ppo_actor = MixStrategy(mlp, saved_ppo_actor, combination)
     else:
         ppo_actor = saved_ppo_actor
     
     ppo_actor.eval()
+
+    #print(next(ppo_actor.parameters()).device)
+    #print(states.device)
 
     ppo_actor_out = ppo_actor(states)
     ppo_actor_probs = F.softmax(ppo_actor_out, dim=1)
@@ -276,7 +287,7 @@ def ppo_eval(model_file, use_mix = False):
 
     phwis = (numerator / denominator).sum() / N  # scalar estimate
 
-    print(f"final score = {phwis}")
+    print(f"PHWIS Score = {phwis}")
 
 
 def lstm_train(use_saved = False):
@@ -287,10 +298,12 @@ def lstm_train(use_saved = False):
     SEQ_LENGTH = 3
 
     x, y = get_sequences(SEQ_LENGTH, observation_action_cols)
+    x = x.to(device)
+    y = y.to(device)
 
     input_dim = len(observation_action_cols)
     output_dim = len(observation_cols)
-    model = EnvLSTM(input_dim, hidden_dim, SEQ_LENGTH, output_dim)
+    model = EnvLSTM(input_dim, hidden_dim, SEQ_LENGTH, output_dim).to(device)
 
     lr = 0.01
     weight_decay = 0.00001
@@ -322,13 +335,15 @@ def transformer_train():
     SEQ_LENGTH = 3
 
     x, y = get_sequences(SEQ_LENGTH, observation_action_cols)
+    x = x.to(device)
+    y = y.to(device)
 
     input_dim = len(observation_action_cols)
     output_dim = len(observation_cols)
     hidden_dim = 64
     num_heads = 4
     num_layers = 3
-    model = EnvTransformer(input_dim, hidden_dim, num_heads, num_layers, output_dim)
+    model = EnvTransformer(input_dim, hidden_dim, num_heads, num_layers, output_dim).to(device)
 
     lr = 0.001
     weight_decay = 0.00001
@@ -366,14 +381,16 @@ def ppo_train(env_type = "lstm"):
     else:
         env_model = torch.load("transformer.pth")
     
-    actor = mlp_train(True)
-    critic = MLP(input_dim, hidden_dim, 1)
+    actor = mlp_train(True).to(device)
+    critic = MLP(input_dim, hidden_dim, 1).to(device)
     actor_optim = optim.Adam(actor.parameters(), lr=lr, weight_decay=weight_decay, eps=1e-5)
     critic_optim = optim.Adam(critic.parameters(), lr=lr, weight_decay=weight_decay, eps=1e-5)
 
     env_model.eval()
 
     x, y = get_sequences(3, observation_action_cols)
+    x = x.to(device)
+    y = y.to(device)
 
     sofa_index = observation_cols.index('o:SOFA')
     lactate_index = observation_cols.index('o:Arterial_lactate')
@@ -422,7 +439,7 @@ def ppo_train(env_type = "lstm"):
             # print(next_timestep.shape)
 
             reward = (C1 * (next_timestep[:, 0, sofa_index] - current_timestep[:, sofa_index]) \
-                    + C2 * np.tanh(next_timestep[:, 0, lactate_index] - current_timestep[:, lactate_index]))
+                    + C2 * torch.tanh(next_timestep[:, 0, lactate_index] - current_timestep[:, lactate_index]))
             
             batch_rewards.append(reward)
         #print(torch.stack(batch_action_probs).T.shape)
@@ -547,7 +564,7 @@ def fqi():
     
     return Q_models
 
-def phwdr(model_file, use_mix = False):
+def phwdr(model_file, use_mix = False, combination = ("ppo", "ppo","ppo")):
     
     C1 = -0.125
     C2 = -2
@@ -577,12 +594,11 @@ def phwdr(model_file, use_mix = False):
     behavior_preds_actions = behavior_preds[np.arange(behavior_preds.shape[0]), actions]
     behavior_probs_actions = behavior_preds[np.arange(behavior_probs.shape[0]), actions]
 
-    print(behavior_probs.shape)
-    saved_ppo_actor = torch.load(model_file)
+    saved_ppo_actor = torch.load(model_file, map_location = 'cpu')
 
     if use_mix:
         mlp = torch.load("mlp.pth")
-        ppo_actor = MixStrategy(mlp, saved_ppo_actor)
+        ppo_actor = MixStrategy(mlp, saved_ppo_actor, combination)
     else:
         ppo_actor = saved_ppo_actor
     
@@ -639,11 +655,11 @@ def phwdr(model_file, use_mix = False):
 
     score = sum_1 + sum_2
 
-    print(f"phwdr score = {score}")
+    print(f"PHWDR Score = {score}")
 
 def split_dataset(max_traj_id = 5000):
 
-    df = pd.read_csv('../../sepsis_final_data_withTimes.csv')
+    df = pd.read_csv('sepsis_final_data_withTimes.csv')
 
     filtered_groups = df.groupby('traj').size() 
     filtered_groups = filtered_groups[filtered_groups == 1].index
@@ -659,7 +675,7 @@ def split_dataset(max_traj_id = 5000):
     train_df = df.iloc[train_idx].reset_index(drop=True)
     test_df = df.iloc[test_idx].reset_index(drop=True)
 
-    valid = len(set(train_df['a:action'].unique())) == 25 and len(set(test_df['a:action'].unique())) == 25
+    valid = len(train_df['a:action'].unique()) == 25 and len(test_df['a:action'].unique()) == 25
     train_trajs = len(train_df['traj'].unique())
     test_trajs = len(test_df['traj'].unique())
     print(f"Train trajs: {train_trajs}, Test trajs: {test_trajs}")
@@ -668,26 +684,36 @@ def split_dataset(max_traj_id = 5000):
     train_df.to_csv('data_filtered_train.csv', index=False)
     test_df.to_csv('data_filtered_test.csv', index=False)
 
+def test_all():
+
+    combinations = [("mlp" if i else "ppo", "mlp" if j else "ppo", "mlp" if k else "ppo") for i in range(2) for j in range(2) for k in range(2)]
+    
+    print("Testing LSTM PPO")
+    for comb in combinations:
+        print(f"Testing with combination, Low: {comb[0]}, Medium: {comb[1]}, High: {comb[2]}")
+        ppo_eval("ppo_actor_lstm.pth", True, comb)
+        phwdr("ppo_actor_lstm.pth", True, comb)
+    
+    print("\nTesting Transformer PPO")
+    for comb in combinations:
+        print(f"Testing with combination, Low: {comb[0]}, Medium: {comb[1]}, High: {comb[2]}")
+        ppo_eval("ppo_actor_transformer.pth", True, comb)
+        phwdr("ppo_actor_transformer.pth", True, comb)
 
 def main():
     #mlp_train()
     #lstm_train()
-    #ppo_train("lstm")
+    #ppo_train("transformer")
     #mlp_eval()
     #ppo_eval("ppo_actor_transformer.pth", True)
     #phwdr("ppo_actor_lstm.pth", True)
-    split_dataset()
+    #split_dataset()
 
     #transformer_train()
 
     #fqi()
-    #phwdr()
 
-    # LSTM - final score = 27.956998825073242
-    # Transformer - final score = 12.839700698852539
-    #               final score = 26.4208927154541
-
-    #print(df.groupby('traj').size().min())
+    test_all()
 
 main()
     
