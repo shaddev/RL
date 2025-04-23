@@ -11,6 +11,8 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestRegressor
 from collections import defaultdict
 import pickle
+import random
+import matplotlib.pyplot as plt
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -38,9 +40,13 @@ class EnvLSTM(nn.Module):
         self.lin = nn.Linear(hidden_size, output_size)
     
     def forward(self, x):
+        # if torch.isnan(x).any() or torch.isinf(x).any():
+        #     raise RuntimeError("Input contains NaN or Inf values.")
         out, (hn, cn) = self.lstm(x)
         x = self.relu(out[:, -1, :])
         x = self.lin(x)
+        # if torch.isnan(x).any() or torch.isinf(x).any():
+        #     raise RuntimeError("Output contains NaN or Inf values.")
         return x
     
 class EnvTransformer(nn.Module):
@@ -229,7 +235,7 @@ def ppo_eval(model_file, use_mix = False, combination = ("ppo", "ppo","ppo")):
     # KNN for behavior policy
     states_train = torch.tensor(df[observation_cols].values, dtype=torch.float32)
     actions_train = torch.tensor(df["a:action"].values, dtype=torch.int64)
-    knn = KNeighborsClassifier(n_neighbors=50)
+    knn = KNeighborsClassifier(n_neighbors=100)
     knn.fit(states_train, actions_train)
     #print("Trained KNN")
     behavior_probs = knn.predict_proba(df_test[observation_cols].values)
@@ -305,13 +311,13 @@ def lstm_train(use_saved = False):
     output_dim = len(observation_cols)
     model = EnvLSTM(input_dim, hidden_dim, SEQ_LENGTH, output_dim).to(device)
 
-    lr = 0.01
+    lr = 0.001
     weight_decay = 0.00001
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     criterion = nn.MSELoss()
 
-    epochs = 1000
+    epochs = 2000
     for epoch in range(epochs):
         output = model(x)
         #print(output.dtype)
@@ -320,6 +326,7 @@ def lstm_train(use_saved = False):
 
         optimizer.zero_grad()
         loss.backward()
+        #nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
         optimizer.step()
 
         print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}')
@@ -340,8 +347,8 @@ def transformer_train():
 
     input_dim = len(observation_action_cols)
     output_dim = len(observation_cols)
-    hidden_dim = 64
-    num_heads = 4
+    hidden_dim = 128
+    num_heads = 8
     num_layers = 3
     model = EnvTransformer(input_dim, hidden_dim, num_heads, num_layers, output_dim).to(device)
 
@@ -657,13 +664,13 @@ def phwdr(model_file, use_mix = False, combination = ("ppo", "ppo","ppo")):
 
     print(f"PHWDR Score = {score}")
 
-def split_dataset(max_traj_id = 5000):
+def split_dataset(max_traj_id = 1000):
 
-    df = pd.read_csv('sepsis_final_data_withTimes.csv')
+    df = pd.read_csv('../../sepsis_final_data_withTimes.csv')
 
     filtered_groups = df.groupby('traj').size() 
     filtered_groups = filtered_groups[filtered_groups == 1].index
-    df = df[~df.isin(filtered_groups)]
+    df = df[~df['traj'].isin(filtered_groups)]
 
     df = df[df['traj'] <= max_traj_id]
 
@@ -700,20 +707,140 @@ def test_all():
         ppo_eval("ppo_actor_transformer.pth", True, comb)
         phwdr("ppo_actor_transformer.pth", True, comb)
 
+def compare_rollout():
+
+    df_test = pd.read_csv('data_filtered_test.csv')
+
+    filtered_groups = df_test.groupby('traj').size() 
+    filtered_groups = filtered_groups[filtered_groups <= 15].index
+    df_test = df_test[~df_test['traj'].isin(filtered_groups)]
+
+    traj = random.choice(df_test['traj'].unique())
+    #traj = 4094
+    print(f"Simulating traj id {traj}")
+    
+    df_test = df_test[df_test['traj'] == traj]
+
+    obs_act = torch.tensor(df_test[observation_action_cols].values, dtype=torch.float32)
+
+    N = len(obs_act)
+
+    print(f"N = {N}")
+
+    # if N <= 3:
+    #     raise RuntimeError("Trajectory too small")
+
+    sofa_index = observation_cols.index('o:SOFA')
+
+    lstm = torch.load("lstm.pth", map_location='cpu')
+    transformer = torch.load("transformer.pth", map_location='cpu')
+
+    state = obs_act[:3]
+    #print(obs_act)
+
+    y_lstm = [k[sofa_index].item() for k in state]
+    y_transformer = [k[sofa_index].item() for k in state]
+    y_true = [k[sofa_index].item() for k in obs_act]
+
+    state = state.unsqueeze(1)
+
+    for timestep in range(1, N - 2):
+        #print(state[:,0,-1])
+        state = lstm(state)
+        y_lstm.append(state[-1][sofa_index].item())
+        state = torch.cat((state, obs_act[timestep:timestep+3, -1].unsqueeze(1)), dim=1).unsqueeze(1)
+    
+    for timestep in range(1, N - 2):
+        state = transformer(state)
+        y_transformer.append(state[-1][sofa_index].item())
+        state = torch.cat((state, obs_act[timestep:timestep+3, -1].unsqueeze(1)), dim=1).unsqueeze(1)
+    
+    x = list(range(1, N+1))
+
+    lstm_mse = sum([(x-y)**2 for (x,y) in zip(y_lstm, y_true)]) / N
+    transformer_mse = sum([(x-y)**2 for (x,y) in zip(y_transformer, y_true)]) / N
+
+    print(f"LSTM: MSE = {lstm_mse}")
+    print(y_lstm)
+    print(f"Transformer: MSE = {transformer_mse}")
+    print(y_transformer)
+    print("Y True:")
+    print(y_true)
+
+    plt.plot(x, y_true, color='red', label='Clinician')
+    plt.plot(x, y_lstm, color='green', label='LSTM')
+    plt.plot(x, y_transformer, color='blue', label='Transformer')
+
+    plt.title('Simulated Rollouts')
+    plt.xlabel('Timestep')
+    plt.ylabel('(Z-Normalized) Sofa Score')
+    plt.legend()
+    plt.grid(True)
+
+    plt.savefig(f'rollout-{traj}-{N}.png')
+    #plt.show()
+
+def policy_density(model_file, combination = ("mlp", "mlp","ppo")):
+
+    states = torch.tensor(df_test[observation_cols].values, dtype=torch.float32)
+
+    mlp = torch.load("mlp.pth")
+    saved_ppo_actor = torch.load(model_file, map_location='cpu')
+
+    ppo_actor = MixStrategy(mlp, saved_ppo_actor, combination)
+    
+    ppo_actor.eval()
+
+    ppo_actions = ppo_actor(states).argmax(dim=1).numpy()
+    x = []
+    y = []
+
+    # actions = (io-1)*5 + (vc-1)
+    # X-axis : vc, Y-axis: io
+    for num in ppo_actions:
+        x.append(num % 5)
+        y.append(num // 5)
+
+    # Create 2D histogram
+    if "lstm" in model_file:
+        plt.hist2d(x, y, bins=[np.arange(0, 6), np.arange(0, 6)], cmap='Blues')
+        plt.colorbar(label='Actions taken')
+        plt.xlabel('Vasopressor dosage')
+        plt.ylabel('IV Fluid Dosage')
+        plt.title('Optimal PPO-Transformer policy (based on PHWIS)')
+        plt.grid(True)
+        plt.savefig('lstm_policy.png')
+        #plt.show()
+        plt.close()
+    else:
+        plt.hist2d(x, y, bins=[np.arange(0, 6), np.arange(0, 6)], cmap='Greens')
+        plt.colorbar(label='Actions taken')
+        plt.xlabel('Vasopressor dosage')
+        plt.ylabel('IV Fluid Dosage')
+        plt.title('Optimal PPO-Transformer policy (based on PHWIS)')
+        plt.grid(True)
+        plt.savefig('transformer_policy.png')
+        #plt.show()
+        plt.close()
+
+
 def main():
-    #mlp_train()
-    #lstm_train()
-    #ppo_train("transformer")
-    #mlp_eval()
-    #ppo_eval("ppo_actor_transformer.pth", True)
-    #phwdr("ppo_actor_lstm.pth", True)
     #split_dataset()
+    #mlp_train()
+
+    #lstm_train()
+    #ppo_train("lstm")
 
     #transformer_train()
+    #ppo_train("transformer")
 
     #fqi()
-
-    test_all()
+    #phwdr("ppo_actor_lstm.pth", True)
+    #ppo_eval("ppo_actor_lstm.pth", True)
+    
+    #test_all()
+    #compare_rollout()
+    policy_density("ppo_actor_lstm.pth")
+    policy_density("ppo_actor_transformer.pth")
 
 main()
-    
