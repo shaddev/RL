@@ -780,7 +780,7 @@ def compare_rollout():
     plt.savefig(f'rollout-{traj}-{N}.png')
     #plt.show()
 
-def policy_density(model_file, combination = ("mlp", "mlp","ppo")):
+def policy_density(model_file, combination = ("ppo", "ppo","ppo")):
 
     states = torch.tensor(df_test[observation_cols].values, dtype=torch.float32)
 
@@ -807,7 +807,7 @@ def policy_density(model_file, combination = ("mlp", "mlp","ppo")):
         plt.colorbar(label='Actions taken')
         plt.xlabel('Vasopressor dosage')
         plt.ylabel('IV Fluid Dosage')
-        plt.title('Optimal PPO-Transformer policy (based on PHWIS)')
+        plt.title('Optimal PPO-LSTM policy (based on PHWIS)')
         plt.grid(True)
         plt.savefig('lstm_policy.png')
         #plt.show()
